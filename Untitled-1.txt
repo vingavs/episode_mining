@@ -1,0 +1,214 @@
+import pandas as pd
+import numpy as np
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from pyspark.sql import functions as F
+sc =SparkContext()
+sqlContext = SQLContext(sc)
+sc.setLogLevel("ERROR")
+import datetime
+import sys
+import datetime
+import warnings
+warnings.filterwarnings("ignore")
+from functools import reduce
+print(datetime.datetime.now())
+
+ALERT_TABLE_READ ="105_ALERTS_V2"
+MASTER_TABLE_READ = "105_CORRELATION_SUPPRESSION_MASTER_V2"
+MASTER_TABLE_WRITE = "105_CORRELATION_SUPPRESSION_MASTER_V2"
+# Phoenix_url ="10.154.0.5:12181"
+Phoenix_url = "10.154.0.30:2181/solr"
+Phoenix_url1 = "10.154.0.30:2181:/hbase-unsecure"
+
+data = sqlContext.read.format("solr").option("collection", ALERT_TABLE_READ).option("zkhost", Phoenix_url).option("solr.params","fq=SuppressID_s:* AND !GavelStatus_s:Closed AND !GavelStatus_s:Resolved AND GavelAlertTime_UTC_dt:[2019-01-10T12:13:13Z TO NOW]").option("max_rows","1000000").load()
+
+
+data = data.select(data.id,data.GavelAlertTime_UTC_dt,
+                   F.when(F.col("GavelStatus_s").isNotNull(), F.col("GavelStatus_s")).otherwise(F.lit("NULL")).alias("Status1_s"), \
+                   F.when(F.col("SuppCaseCreatedDate_UTC_dt").isNotNull(), F.col("SuppCaseCreatedDate_UTC_dt")).otherwise(F.lit("NULL")).alias("GavelCaseCreatedTime"),\
+                   F.when(F.col("SuppressID_s").isNotNull(), F.col("SuppressID_s")).otherwise(F.lit("NULL")).alias("GavelCaseID_s"),\
+                   F.when(F.col("SuppressType_s").isNotNull(), F.col("SuppressType_s")).otherwise(F.lit("NULL")).alias("GavelCaseType_s"),\
+                   F.when(F.col("DeviceMaintananceFlag_s").isNotNull(), F.col("DeviceMaintananceFlag_s")).otherwise(F.lit("NULL")).alias("DeviceMaintananceFlag"),data.GavelDescription_s.alias("GavelDescription"),data.GavelToolName_s,data.GavelDeviceName_s,data.GavelSeverity_s).toPandas()
+
+
+####################################################################################################
+#The below is is considered at the bottom
+data_list = sqlContext.read.format("solr").option("collection", ALERT_TABLE_READ).option("zkhost", Phoenix_url).option("solr.params","fq=SuppressID_s:* AND !GavelStatus_s:Closed AND !GavelStatus_s:Resolved AND GavelAlertTime_UTC_dt:[2019-01-10T12:13:13Z TO NOW]").option("max_rows","400000").load()
+
+data_list = data_list.select(F.when(F.col("SuppressID_s").isNotNull(), F.col("SuppressID_s")).otherwise(F.lit("NULL")).alias("GavelCaseID"),\
+                   F.when(F.col("GavelToolName_s").isNotNull(), F.col("GavelToolName_s")).otherwise(F.lit("")).alias("GavelToolName"),\
+                   F.when(F.col("DeviceName1_s").isNotNull(), F.col("DeviceName1_s")).otherwise(F.lit("")).alias("GavelDeviceName")).toPandas()
+
+####################################################################################################
+
+
+
+data = data.replace(np.nan, '', regex=True)
+data = data.replace('NULL', '', regex=True)
+data['GavelAlertTime_UTC_dt'] = pd.to_datetime(data['GavelAlertTime_UTC_dt'])
+
+data = data.sort_values(['GavelAlertTime_UTC_dt']).reset_index(drop=True)
+pivot = data[['id','GavelCaseID_s']]
+pivot = pd.pivot_table(pivot, index=['GavelCaseID_s'], aggfunc='count')
+#pivot['GavelCaseID_s'] = pivot.index
+pivot.reset_index(level=0, inplace=True)
+pivot=pivot[['GavelCaseID_s','id']]
+pivot = pivot.rename(columns={'id': 'Count'})
+pivot = pivot.replace(np.nan, '', regex=True)
+
+data = data.merge(pivot, on='GavelCaseID_s', how='left')
+
+#data = data.sort_values(by=['GavelCaseID_s']).reset_index(drop=True)
+
+data['Childdate'] = data.groupby('GavelCaseID_s')['GavelCaseCreatedTime'].transform('last')
+
+data1 = data.loc[data['GavelCaseType_s'] == 'Parent']
+
+data1.loc[data1['Count'] == 1, 'Childdate'] = ''
+
+data1 = data1.rename(columns={'Status1_s':'GavelCaseStatus_s','GavelCaseCreatedTime':'GavelCaseCreatedDate_UTC_dt','Count':'CorrelatedAlertsCount_s','Childdate':'GavelCaseLastModifiedDate_UTC_dt'})
+#data1 = data1[['id','GavelAlertTime_UTC_dt','GavelCaseStatus_s','GavelCaseID_s','GavelCaseCreatedDate_UTC_dt','CorrelatedAlertsCount_s','GavelCaseLastModifiedDate_UTC_dt']]
+
+
+
+count =  data1[['GavelCaseID_s','CorrelatedAlertsCount_s','GavelDescription','GavelSeverity_s']]
+data1 = data1[['GavelAlertTime_UTC_dt','GavelCaseStatus_s','GavelCaseID_s','GavelCaseCreatedDate_UTC_dt','GavelCaseLastModifiedDate_UTC_dt','GavelDescription','GavelSeverity_s','DeviceMaintananceFlag']]
+
+
+
+##########################################################
+
+#data_existing = pd.read_csv("Casemaster_existingopen1.csv")
+
+data_existing = sqlContext.read.format("solr").option("collection", MASTER_TABLE_READ).option("zkhost",Phoenix_url).option("solr.params","fq=!CaseStatus_s:Closed AND !CaseStatus_s:Resolved AND CaseCreatedDate_UTC_dt:[2019-01-11T06:00:00Z TO NOW]").option("max_rows","400000").load()
+
+data_existing = data_existing.select(
+                   F.when(F.col("id").isNotNull(), F.col("id")).otherwise(F.lit("NULL")).alias("GavelCaseID_s"),\
+                   F.when(F.col("CaseStatus_s").isNotNull(), F.col("CaseStatus_s")).otherwise(F.lit("NULL")).alias("GavelCaseStatus_s"), \
+                   F.when(F.col("CaseCreatedDate_UTC_dt").isNotNull(), F.col("CaseCreatedDate_UTC_dt")).otherwise(F.lit("NULL")).alias("GavelCaseCreatedDate_UTC_dt"),\
+                   F.when(F.col("CorrelatedAlertsCount_s").isNotNull(), F.col("CorrelatedAlertsCount_s")).otherwise(F.lit("NULL")).alias("CorrelatedAlertsCount_s"),\
+                   F.when(F.col("CaseLastModifiedDate_UTC_dt").isNotNull(), F.col("CaseLastModifiedDate_UTC_dt")).otherwise(F.lit("NULL")).alias("GavelCaseLastModifiedDate_UTC_dt"),\
+                   F.when(F.col("Flag_s").isNotNull(), F.col("Flag_s")).otherwise(F.lit("NULL")).alias("GavelFlag_s"),\
+                   F.when(F.col("DeviceMaintananceFlag_s").isNotNull(), F.col("DeviceMaintananceFlag_s")).otherwise(F.lit("NULL")).alias("DeviceMaintananceFlag")).toPandas()
+data_existing = data_existing.replace(np.nan, '', regex=True)
+data_existing = data_existing.replace('NULL', '', regex=True)
+
+data_existing['GavelCaseLastModifiedDate_UTC_dt'] = pd.to_datetime(data_existing['GavelCaseLastModifiedDate_UTC_dt'])
+
+data_existing['GavelCaseCreatedDate_UTC_dt'] = pd.to_datetime(data_existing['GavelCaseCreatedDate_UTC_dt'])
+
+
+data_existing = data_existing.rename(columns={'GavelCaseLastModifiedDate_UTC_dt':'GavelCaseLastModifiedDate_UTC_dt_old'})
+data_existing = data_existing[['GavelCaseStatus_s','GavelCaseID_s','GavelCaseCreatedDate_UTC_dt','GavelCaseLastModifiedDate_UTC_dt_old','GavelFlag_s','DeviceMaintananceFlag']]
+
+data_existing = data_existing.append(data1, ignore_index=True)
+data_existing['GavelCaseLastModifiedDate_UTC_dt'] = data_existing.groupby('GavelCaseID_s')['GavelCaseLastModifiedDate_UTC_dt'].transform('last')
+
+data_existing = data_existing.drop_duplicates(subset="GavelCaseID_s",keep="first")
+
+
+##########################################################
+
+newdata = data_existing.reset_index(drop=True)
+newdata = newdata.replace(np.nan, '', regex=True)
+newdata = newdata.replace('NULL', '', regex=True)
+
+#newdata.loc[((newdata['GavelCaseLastModifiedDate_UTC_dt'] == '') & (newdata['GavelCaseLastModifiedDate_UTC_dt_old'] == '') & (newdata['GavelFlag_s'] == '')), 'GavelFlag_s'] = "True"
+newdata.loc[newdata['GavelCaseLastModifiedDate_UTC_dt'] == newdata['GavelCaseLastModifiedDate_UTC_dt_old'], 'GavelFlag_s'] = "FALSE"
+newdata.loc[newdata['GavelCaseLastModifiedDate_UTC_dt'] != newdata['GavelCaseLastModifiedDate_UTC_dt_old'], 'GavelFlag_s'] = "TRUE"
+
+#data_existing['GavelCaseLastModifiedDate_UTC_dt']=data_existing['GavelCaseLastModifiedDate_UTC_dt_old']
+del newdata['GavelCaseLastModifiedDate_UTC_dt_old']
+
+newdata = newdata[['GavelCaseStatus_s','GavelCaseID_s','GavelCaseCreatedDate_UTC_dt','GavelCaseLastModifiedDate_UTC_dt','GavelFlag_s','DeviceMaintananceFlag']]
+
+newdata = newdata.merge(count, on='GavelCaseID_s', how='left')
+
+# Note: If alert comes for the first time(as parent), 'GavelFlag' will not be raised. 
+# Flag will be raised only if Child comes in one by one
+
+newdata = newdata.rename(columns={'GavelCaseID_s':'GavelCaseID','GavelCaseCreatedDate_UTC_dt':'GavelCaseCreatedDate_UTC','GavelCaseLastModifiedDate_UTC_dt':'GavelCaseLastModifiedDate_UTC','CorrelatedAlertsCount_s':'CorrelatedAlertsCount','GavelFlag_s':'GavelFlag','GavelSeverity_s':'GavelCaseSeverity'})
+
+newdata['GavelCaseCreatedDate_UTC'] = pd.to_datetime(newdata['GavelCaseCreatedDate_UTC']).astype(str).str[0:19]
+newdata['TmpGavelCaseCreatedDate_UTC'] = pd.to_datetime(newdata['GavelCaseCreatedDate_UTC']).astype(str).str[0:19]
+newdata['GavelCaseLastModifiedDate_UTC'] = pd.to_datetime(newdata['GavelCaseLastModifiedDate_UTC']).astype(str).str[0:19]
+newdata['TmpGavelCaseLastModifiedDate_UTC'] = newdata['GavelCaseLastModifiedDate_UTC'].astype(str).str[0:19]
+
+
+
+newdata = newdata[['GavelCaseID','GavelCaseCreatedDate_UTC','TmpGavelCaseCreatedDate_UTC','GavelCaseLastModifiedDate_UTC','TmpGavelCaseLastModifiedDate_UTC','CorrelatedAlertsCount','GavelFlag','GavelDescription','GavelCaseSeverity','DeviceMaintananceFlag']]
+
+
+
+####################################################################################################
+data_Tool = data_list.groupby('GavelCaseID').apply(lambda x: ','.join(x.GavelToolName.unique())).reset_index()
+data_Tool.columns = ['GavelCaseID','GavelToolList']
+
+data_Device = data_list.groupby('GavelCaseID').apply(lambda x: ','.join(x.GavelDeviceName.unique())).reset_index()
+data_Device.columns = ['GavelCaseID','GavelDeviceList']
+
+
+#data_Tool = data_list.groupby(['GavelCaseID']).GavelToolName.unique().reset_index()
+#data_Tool = data_Tool.rename(columns={'GavelToolName':'GavelToolList'})
+#data_Tool['GavelToolList'] = data_Tool['GavelToolList'].astype(str)
+#data_Tool['GavelToolList'] = data_Tool['GavelToolList'].str.split(",\s").map(set)
+
+#data_Device = data_list.groupby(['GavelCaseID']).GavelDeviceName.unique().reset_index()
+#data_Device = data_Device.rename(columns={'GavelDeviceName':'GavelDeviceList'})
+#data_Device['GavelDeviceList'] = data_Device['GavelDeviceList'].astype(str)
+#data_Device['GavelDeviceList'] = data_Device['GavelDeviceList'].str.split(",\s").map(set)
+
+newdata = reduce(lambda left,right: pd.merge(left,right,on='GavelCaseID'), [newdata,data_Tool,data_Device])
+#newdata = pd.merge(newdata,data_Tool,on="GavelCaseID",how="left")
+#newdata = pd.merge(newdata,data_Tool,on="GavelCaseID",how="left")
+
+newdata['GavelToolList'] = newdata['GavelToolList'].astype(str)
+newdata['GavelDeviceList'] = newdata['GavelDeviceList'].astype(str)
+newdata['CorrelatedAlertsCount'] = newdata['CorrelatedAlertsCount'].fillna(0).astype(int)
+newdata['CorrelatedAlertsCount'] = newdata['CorrelatedAlertsCount'].astype(str)
+newdata['CorrelatedAlertsCount'].replace('0', '', inplace=True)
+
+#newdata = newdata[['GavelCaseID','GavelCaseCreatedDate_UTC','TmpGavelCaseCreatedDate_UTC','GavelCaseLastModifiedDate_UTC','TmpGavelCaseLastModifiedDate_UTC','CorrelatedAlertsCount','GavelFlag','GavelDescription','GavelToolList','GavelDeviceList','GavelCaseSeverity','DeviceMaintananceFlag']]
+newdata = newdata[['GavelCaseID','GavelCaseCreatedDate_UTC','GavelCaseLastModifiedDate_UTC','CorrelatedAlertsCount','GavelFlag','GavelDescription','GavelToolList','GavelDeviceList','GavelCaseSeverity','DeviceMaintananceFlag']]
+
+
+#newdata = newdata .replace(np.nan, '', regex=True)
+newdata = newdata .replace('null', '', regex=True)
+newdata = newdata.replace('NaT', '', regex=True)
+schema = StructType([
+                            StructField("\"id\"", StringType(), True),
+                            StructField("\"CaseCreatedDate_UTC\"", StringType(), True),
+                            #StructField("\"TmpCaseCreatedDate_UTC\"", StringType(), True),
+                            StructField("\"CaseLastModifiedDate_UTC\"", StringType(), True),
+                            #StructField("\"TmpCaseLastModifiedDate_UTC\"", StringType(), True),
+                            StructField("\"CorrelatedAlertsCount\"", StringType(), True),
+                            StructField("\"Flag\"", StringType(), True),
+                            StructField("\"Description\"", StringType(), True),
+                            StructField("\"ToolList\"", StringType(), True),
+                            StructField("\"DeviceList\"", StringType(), True),
+                            StructField("\"CaseSeverity\"", StringType(), True),
+			    	        StructField("\"DeviceMaintananceFlag\"", StringType(), True)
+                            ])
+Case_Master = sqlContext.createDataFrame(newdata,schema)
+
+Metrics_table = "\""+MASTER_TABLE_WRITE+"\""
+        
+Case_Master.write\
+.format("org.apache.phoenix.spark") \
+.mode("overwrite") \
+.option("driver", "org.apache.phoenix.jdbc.PhoenixDriver") \
+.option("table", Metrics_table) \
+.option("zkUrl", Phoenix_url1) \
+.save()       
+
+print("CaseMaster Done-new")
+print(datetime.datetime.now())
+sc.stop()
+#print(datetime.datetime.now())
+
+
+
+
+
