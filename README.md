@@ -66,3 +66,7 @@ An inplementation of sequential patterm mining method [1].
 
 # Reference
 1. H. Mannila, H. Toivonen, and A. I. Verkamo, “Discovery of Frequent Episodes in Event Sequences,” Data Min. Knowl. Discov., vol. 1, no. 3, pp. 259–289, 1997.
+
+
+
+testing
